@@ -1,0 +1,100 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Traffic Authority Control Room</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Rajdhani:wght@600;700&display=swap" />
+    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <style>
+      body {
+        background: radial-gradient(circle at 12% 0%, #172633 0%, #0d141b 45%, #090d11 100%);
+        color: #e8f0f8;
+      }
+    </style>
+  </head>
+  <body class="wall-mode">
+    <main class="app-shell">
+      <section class="left-column">
+        <section class="panel top-panel">
+          <div class="header-row">
+            <div>
+              <p class="eyebrow">City Traffic Authority</p>
+              <h1 class="heading">CCTV Accident Monitoring Command Center</h1>
+              <p class="subtle">Switch cameras by intersection, monitor all feeds, and run Roboflow detection on the selected focus feed.</p>
+            </div>
+            <div class="mode-switch" role="group" aria-label="Display mode">
+              <button id="wallModeBtn" class="mode-btn active">Wall View</button>
+              <button id="focusModeBtn" class="mode-btn secondary">Focus View</button>
+            </div>
+          </div>
+
+          <div class="toolbar">
+            <label for="intervalInput">Detection interval (ms):</label>
+            <input id="intervalInput" type="number" min="300" step="100" value="1000" />
+            <button id="startBtn">Start Detection</button>
+            <button id="stopBtn" class="secondary">Stop Detection</button>
+            <span class="live-chip" id="connectedCount">0 cameras live</span>
+          </div>
+
+          <div class="focus-meta-row">
+            <div>
+              <p class="subtle">Focused intersection</p>
+              <p class="focus-name" id="focusName">Not selected</p>
+            </div>
+            <div id="status" class="status">Idle</div>
+          </div>
+        </section>
+
+        <section class="panel focus-panel" id="focusPanel">
+          <div class="video-wrap">
+            <video id="focusVideo" autoplay muted playsinline></video>
+            <canvas id="focusOverlay"></canvas>
+          </div>
+        </section>
+
+        <section class="panel feeds-panel">
+          <div class="header-row">
+            <h2 class="heading">Intersection Camera Matrix</h2>
+            <p class="subtle">Click Focus on any tile to switch detection target.</p>
+          </div>
+          <div id="intersectionGrid" class="intersection-grid"></div>
+        </section>
+      </section>
+
+      <aside class="panel right-panel">
+        <h2 class="heading">Incident Intelligence</h2>
+        <p class="subtle">Accident detections, confidence scores, and snapshots.</p>
+
+        <section class="cards">
+          <article class="card">
+            <p class="subtle">Total accidents</p>
+            <p class="metric" id="totalEvents">0</p>
+          </article>
+          <article class="card">
+            <p class="subtle">Last 24h</p>
+            <p class="metric" id="last24h">0</p>
+          </article>
+          <article class="card">
+            <p class="subtle">Current focus accidents</p>
+            <p class="metric" id="currentDetections">0</p>
+          </article>
+        </section>
+
+        <section class="authority-panel">
+          <h3 class="heading">Authority Monitoring Checklist</h3>
+          <p class="subtle">Live checks for required controls and unacceptable conditions.</p>
+          <div id="checklistList" class="checklist-list"></div>
+          <div class="missing-wrap">
+            <p class="subtle">Missing / Action Needed</p>
+            <ul id="missingList" class="missing-list"></ul>
+          </div>
+        </section>
+
+        <section class="events" id="eventsList"></section>
+      </aside>
+    </main>
+
+    <script src="/static/app.js?v=3"></script>
+  </body>
+</html>
