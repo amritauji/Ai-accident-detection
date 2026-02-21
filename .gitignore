@@ -1,0 +1,26 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local databases
+*.db
+
+# Runtime artifacts
+backend/snapshots/*
+!backend/snapshots/.gitkeep
+
+# Virtual environments
+.venv/
+venv/
+jarvis_env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
