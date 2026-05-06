@@ -186,6 +186,11 @@ button.secondary {
   display: block;
 }
 
+#focusVideo {
+  object-fit: cover;
+  background: #05090c;
+}
+
 #focusOverlay {
   position: absolute;
   inset: 0;
@@ -236,6 +241,63 @@ button.secondary {
   margin-top: 8px;
   display: grid;
   gap: 6px;
+}
+
+.source-label {
+  color: var(--ink);
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.source-input {
+  width: 100%;
+  background: #101d27;
+  color: var(--ink);
+}
+
+.source-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.camera-dialog.hidden {
+  display: none;
+}
+
+.camera-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.camera-dialog-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 7, 11, 0.74);
+  backdrop-filter: blur(4px);
+}
+
+.camera-dialog-panel {
+  position: relative;
+  width: min(640px, 100%);
+  border: 1px solid #2a3f4f;
+  border-radius: 18px;
+  padding: 18px;
+  background: linear-gradient(160deg, #0f1b24, #0b141b);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.dialog-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 .control-row {

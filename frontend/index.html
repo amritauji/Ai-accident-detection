@@ -21,7 +21,7 @@
             <div>
               <p class="eyebrow">City Traffic Authority</p>
               <h1 class="heading">CCTV Accident Monitoring Command Center</h1>
-              <p class="subtle">Switch cameras by intersection, monitor all feeds, and run Roboflow detection on the selected focus feed.</p>
+              <p class="subtle">Add an RTSP or IP camera URL for each intersection, monitor all feeds, and run detection on the selected focus feed.</p>
             </div>
             <div class="mode-switch" role="group" aria-label="Display mode">
               <button id="wallModeBtn" class="mode-btn active">Wall View</button>
@@ -48,7 +48,7 @@
 
         <section class="panel focus-panel" id="focusPanel">
           <div class="video-wrap">
-            <video id="focusVideo" autoplay muted playsinline></video>
+            <img id="focusVideo" alt="Focused camera feed" />
             <canvas id="focusOverlay"></canvas>
           </div>
         </section>
@@ -56,7 +56,7 @@
         <section class="panel feeds-panel">
           <div class="header-row">
             <h2 class="heading">Intersection Camera Matrix</h2>
-            <p class="subtle">Click Focus on any tile to switch detection target.</p>
+            <p class="subtle">Enter an IP/RTSP source for each tile, save it, then click Focus to switch the active detection target.</p>
           </div>
           <div id="intersectionGrid" class="intersection-grid"></div>
         </section>
@@ -94,6 +94,20 @@
         <section class="events" id="eventsList"></section>
       </aside>
     </main>
+
+    <div id="cameraDialog" class="camera-dialog hidden" aria-hidden="true">
+      <div class="camera-dialog-backdrop" data-action="close"></div>
+      <div class="camera-dialog-panel" role="dialog" aria-modal="true" aria-labelledby="cameraDialogTitle">
+        <h3 class="heading" id="cameraDialogTitle">Set camera source</h3>
+        <p class="subtle">Enter an RTSP or IP camera URL for the selected tile.</p>
+        <label class="source-label" for="cameraDialogInput">IP / RTSP camera URL</label>
+        <input id="cameraDialogInput" class="source-input" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="rtsp://user:pass@192.168.1.20:554/stream or http://192.168.1.20:8080/video" />
+        <div class="dialog-actions">
+          <button id="cameraDialogSaveBtn">Save Source</button>
+          <button id="cameraDialogCancelBtn" class="secondary">Cancel</button>
+        </div>
+      </div>
+    </div>
 
     <script src="/static/app.js?v=3"></script>
   </body>

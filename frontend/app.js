@@ -1,4 +1,4 @@
-const focusVideo = document.getElementById("focusVideo");
+const focusFeed = document.getElementById("focusVideo");
 const focusOverlay = document.getElementById("focusOverlay");
 const intersectionGrid = document.getElementById("intersectionGrid");
 const focusNameEl = document.getElementById("focusName");
@@ -15,6 +15,11 @@ const currentDetectionsEl = document.getElementById("currentDetections");
 const eventsList = document.getElementById("eventsList");
 const checklistList = document.getElementById("checklistList");
 const missingList = document.getElementById("missingList");
+const cameraDialog = document.getElementById("cameraDialog");
+const cameraDialogTitle = document.getElementById("cameraDialogTitle");
+const cameraDialogInput = document.getElementById("cameraDialogInput");
+const cameraDialogSaveBtn = document.getElementById("cameraDialogSaveBtn");
+const cameraDialogCancelBtn = document.getElementById("cameraDialogCancelBtn");
 
 const intersections = [
   { id: "int-1", name: "Main St & 1st Ave" },
@@ -29,32 +34,55 @@ const intersections = [
 ];
 
 const state = {
-  devices: [],
+  cameras: new Map(),
   items: new Map(),
   focusedId: null,
+  dialogCameraId: null,
   eventsTimer: null,
   detectionInFlight: false,
   detectionActive: false,
   lastPredictions: [],
-  lastCaptureWidth: 0,
-  lastCaptureHeight: 0,
   lastDetectionLatencyMs: null,
   lastHealth: null,
   lastEventsRefreshAt: 0,
   viewMode: "wall",
+  focusRefreshTimer: null,
 };
 
-const DETECTION_MAX_DIM = 640;
-const DETECTION_JPEG_QUALITY = 0.65;
 const EVENTS_REFRESH_MS = 3000;
 const HEALTH_REFRESH_MS = 5000;
 
 function makeInitialIntersectionState() {
   return {
-    stream: null,
-    deviceId: "",
+    sourceDraft: "",
     elements: null,
   };
+}
+
+function cameraStreamUrl(intersectionId) {
+  return `/api/cameras/${intersectionId}/stream?ts=${Date.now()}`;
+}
+
+function placeholderFeed(title, subtitle) {
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+      <defs>
+        <linearGradient id="g" x1="0" x2="1" y1="0" y2="1">
+          <stop offset="0%" stop-color="#0b1320" />
+          <stop offset="100%" stop-color="#162633" />
+        </linearGradient>
+      </defs>
+      <rect width="960" height="540" rx="24" fill="url(#g)" />
+      <circle cx="120" cy="120" r="70" fill="rgba(41,164,255,0.14)" />
+      <circle cx="820" cy="430" r="100" fill="rgba(15,161,118,0.14)" />
+      <text x="60" y="220" fill="#e8f0f8" font-size="40" font-family="Manrope,Segoe UI,sans-serif" font-weight="700">${title}</text>
+      <text x="60" y="278" fill="#9cb2c7" font-size="22" font-family="Manrope,Segoe UI,sans-serif">${subtitle}</text>
+    </svg>`;
+  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+}
+
+function getCameraConfig(intersectionId) {
+  return state.cameras.get(intersectionId) || { source_url: "", label: "" };
 }
 
 function setStatus(text, type = "") {
@@ -63,8 +91,8 @@ function setStatus(text, type = "") {
 }
 
 function renderAuthorityChecklist() {
-  const connectedCount = [...state.items.values()].filter((item) => item.stream).length;
-  const hasFocusedLive = Boolean(state.focusedId && state.items.get(state.focusedId)?.stream);
+  const configuredCount = [...state.cameras.values()].filter((camera) => camera.source_url).length;
+  const hasFocusedConfigured = Boolean(state.focusedId && getCameraConfig(state.focusedId)?.source_url);
   const hasApiHealth = state.lastHealth?.status === "ok";
   const hasDetectionMode = Boolean(state.lastHealth?.mode);
   const hasRecentEventsSync = state.lastEventsRefreshAt > 0 && Date.now() - state.lastEventsRefreshAt <= EVENTS_REFRESH_MS * 2;
@@ -72,10 +100,10 @@ function renderAuthorityChecklist() {
   const noActiveAccident = Number(currentDetectionsEl.textContent || "0") === 0;
 
   const checks = [
-    { label: "Backend API reachable", ok: hasApiHealth, bad: "System down risk" },
+    { label: "Backend API reachable", ok: hasApiHealth, bad: "API offline" },
     { label: "Detection mode available", ok: hasDetectionMode, bad: "Detector not configured" },
-    { label: "At least one camera connected", ok: connectedCount > 0, bad: "Blind monitoring" },
-    { label: "Focused feed is live", ok: hasFocusedLive, bad: "No active target feed" },
+    { label: "At least one camera configured", ok: configuredCount > 0, bad: "No RTSP/IP source set" },
+    { label: "Focused feed has a source", ok: hasFocusedConfigured, bad: "Pick an IP camera URL for focus" },
     { label: "Detection latency <= 1.2s", ok: latencyOk, bad: "Slow alert response" },
     { label: "Events feed fresh", ok: hasRecentEventsSync, bad: "Stale dashboard data" },
     { label: "No active accident", ok: noActiveAccident, bad: "Incident ongoing" },
@@ -115,19 +143,9 @@ function setViewMode(mode) {
   focusModeBtn.classList.toggle("active", mode === "focus");
 }
 
-async function loadDevices() {
-  const devices = await navigator.mediaDevices.enumerateDevices();
-  state.devices = devices.filter((device) => device.kind === "videoinput");
-}
-
-function getDeviceLabel(deviceId) {
-  const device = state.devices.find((item) => item.deviceId === deviceId);
-  return device ? device.label || "Camera" : "Unassigned";
-}
-
 function updateConnectedCount() {
-  const liveCount = [...state.items.values()].filter((item) => item.stream).length;
-  connectedCountEl.textContent = `${liveCount} camera${liveCount === 1 ? "" : "s"} live`;
+  const configuredCount = [...state.cameras.values()].filter((camera) => camera.source_url).length;
+  connectedCountEl.textContent = `${configuredCount} camera${configuredCount === 1 ? "" : "s"} configured`;
 }
 
 function updateFocusedCardStyles() {
@@ -135,6 +153,42 @@ function updateFocusedCardStyles() {
     if (!itemState.elements?.card) return;
     itemState.elements.card.classList.toggle("active", id === state.focusedId);
   });
+}
+
+async function loadCameraConfigs() {
+  try {
+    const response = await fetch("/api/cameras");
+    if (!response.ok) throw new Error("Failed to load cameras");
+    const data = await response.json();
+    state.cameras.clear();
+    (data.cameras || []).forEach((camera) => {
+      state.cameras.set(camera.id, camera);
+    });
+  } catch (_error) {
+    state.cameras.clear();
+    intersections.forEach((intersection) => {
+      state.cameras.set(intersection.id, { id: intersection.id, label: intersection.name, source_url: "", last_error: "" });
+    });
+  }
+}
+
+function syncTileFromCamera(itemState, camera, intersection) {
+  if (!itemState.elements) return;
+
+  const { preview, badge, sourceInput } = itemState.elements;
+  if (sourceInput && document.activeElement !== sourceInput) {
+    sourceInput.value = itemState.sourceDraft || camera.source_url || "";
+  }
+
+  if (camera.source_url) {
+    preview.src = cameraStreamUrl(intersection.id);
+    badge.textContent = camera.last_error ? `Error: ${camera.last_error}` : `Live: ${camera.label || intersection.name}`;
+    badge.classList.toggle("live", !camera.last_error);
+  } else {
+    preview.src = placeholderFeed(intersection.name, "No source configured");
+    badge.textContent = "Offline";
+    badge.classList.remove("live");
+  }
 }
 
 function renderIntersectionCards() {
@@ -146,6 +200,7 @@ function renderIntersectionCards() {
     }
 
     const itemState = state.items.get(intersection.id);
+    const camera = getCameraConfig(intersection.id);
 
     const card = document.createElement("article");
     card.className = "intersection-card";
@@ -153,68 +208,73 @@ function renderIntersectionCards() {
     card.innerHTML = `
       <h3>${intersection.name}</h3>
       <p class="subtle">${intersection.id.toUpperCase()}</p>
-      <video class="feed-preview" autoplay muted playsinline></video>
+      <img class="feed-preview" alt="${intersection.name} camera preview" />
       <div class="intersection-controls">
-        <select></select>
+        <label class="source-label" for="source-${intersection.id}">IP / RTSP camera URL</label>
+        <input id="source-${intersection.id}" class="source-input" type="text" placeholder="rtsp://user:pass@192.168.1.20:554/stream or http://192.168.1.20:8080/video" />
+        <p class="source-hint">Use an RTSP, HTTP, or IP camera URL. Save it to start the backend stream.</p>
         <div class="control-row">
-          <button data-action="connect">Connect</button>
+          <button data-action="save">Apply Feed</button>
+          <button data-action="edit" class="secondary">Edit URL</button>
           <button data-action="focus" class="secondary">Focus</button>
-          <button data-action="disconnect" class="secondary">Off</button>
+          <button data-action="clear" class="secondary">Clear</button>
         </div>
       </div>
       <span class="feed-badge">Offline</span>
     `;
 
-    const video = card.querySelector("video");
-    const select = card.querySelector("select");
+    const preview = card.querySelector("img.feed-preview");
+    const sourceInput = card.querySelector("input.source-input");
     const badge = card.querySelector(".feed-badge");
-    const connectBtn = card.querySelector("button[data-action='connect']");
+    const saveBtn = card.querySelector("button[data-action='save']");
+    const editBtn = card.querySelector("button[data-action='edit']");
     const focusBtn = card.querySelector("button[data-action='focus']");
-    const disconnectBtn = card.querySelector("button[data-action='disconnect']");
+    const clearBtn = card.querySelector("button[data-action='clear']");
 
-    select.innerHTML = "<option value=\"\">Select camera</option>";
-    state.devices.forEach((camera, index) => {
-      const option = document.createElement("option");
-      option.value = camera.deviceId;
-      option.textContent = camera.label || `Camera ${index + 1}`;
-      select.appendChild(option);
+    sourceInput.value = itemState.sourceDraft || camera.source_url || "";
+
+    sourceInput.addEventListener("input", () => {
+      itemState.sourceDraft = sourceInput.value;
     });
 
-    if (itemState.deviceId) {
-      select.value = itemState.deviceId;
-    }
-
-    connectBtn.addEventListener("click", async () => {
-      const chosenId = select.value;
-      if (!chosenId) {
-        setStatus(`Select a camera for ${intersection.name}`, "alert");
-        return;
+    sourceInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        saveBtn.click();
       }
+    });
+
+    saveBtn.addEventListener("click", async () => {
+      await saveCameraSource(intersection.id, sourceInput.value.trim(), intersection.name);
+    });
+
+    editBtn.addEventListener("click", () => openCameraDialog(intersection.id));
+
+    clearBtn.addEventListener("click", async () => {
       try {
-        await connectIntersection(intersection.id, chosenId);
-        badge.textContent = `Live: ${getDeviceLabel(chosenId)}`;
-        badge.classList.add("live");
+        const response = await fetch(`/api/cameras/${intersection.id}`, { method: "DELETE" });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(detail || "Failed to clear camera source");
+        }
+
+        itemState.sourceDraft = "";
+        await loadCameraConfigs();
+        renderIntersectionCards();
+        if (state.focusedId === intersection.id) {
+          setFocusedIntersection(intersection.id);
+        }
+        setStatus(`${intersection.name} cleared`, "ok");
       } catch (error) {
-        setStatus(`Camera error at ${intersection.name}: ${error.message}`, "alert");
+        setStatus(`Clear failed for ${intersection.name}: ${error.message}`, "alert");
       }
     });
 
     focusBtn.addEventListener("click", () => setFocusedIntersection(intersection.id));
-    video.addEventListener("click", () => setFocusedIntersection(intersection.id));
+    preview.addEventListener("click", () => setFocusedIntersection(intersection.id));
 
-    disconnectBtn.addEventListener("click", () => {
-      disconnectIntersection(intersection.id);
-      badge.textContent = "Offline";
-      badge.classList.remove("live");
-    });
-
-    itemState.elements = { card, video, select, badge };
-
-    if (itemState.stream) {
-      video.srcObject = itemState.stream;
-      badge.textContent = `Live: ${getDeviceLabel(itemState.deviceId)}`;
-      badge.classList.add("live");
-    }
+    itemState.elements = { card, preview, sourceInput, badge };
+    syncTileFromCamera(itemState, camera, intersection);
 
     intersectionGrid.appendChild(card);
   });
@@ -224,52 +284,59 @@ function renderIntersectionCards() {
   renderAuthorityChecklist();
 }
 
-async function connectIntersection(intersectionId, deviceId) {
-  const itemState = state.items.get(intersectionId);
-  if (!itemState) return;
+function openCameraDialog(cameraId) {
+  const intersection = intersections.find((item) => item.id === cameraId);
+  if (!intersection) return;
 
-  disconnectIntersection(intersectionId);
+  const itemState = state.items.get(cameraId);
+  const camera = getCameraConfig(cameraId);
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { deviceId: { exact: deviceId } },
-    audio: false,
-  });
+  state.dialogCameraId = cameraId;
+  cameraDialogTitle.textContent = `Set source for ${intersection.name}`;
+  cameraDialogInput.value = itemState?.sourceDraft || camera.source_url || "";
+  cameraDialog.classList.remove("hidden");
+  cameraDialog.setAttribute("aria-hidden", "false");
 
-  itemState.stream = stream;
-  itemState.deviceId = deviceId;
-  if (itemState.elements?.video) {
-    itemState.elements.video.srcObject = stream;
-  }
-
-  if (state.focusedId === intersectionId) {
-    focusVideo.srcObject = stream;
-  }
-
-  updateConnectedCount();
-  setStatus(`${intersections.find((entry) => entry.id === intersectionId)?.name} connected`, "ok");
-  renderAuthorityChecklist();
+  window.setTimeout(() => {
+    cameraDialogInput.focus();
+    cameraDialogInput.select();
+  }, 0);
 }
 
-function disconnectIntersection(intersectionId) {
-  const itemState = state.items.get(intersectionId);
-  if (!itemState) return;
+function closeCameraDialog() {
+  state.dialogCameraId = null;
+  cameraDialog.classList.add("hidden");
+  cameraDialog.setAttribute("aria-hidden", "true");
+}
 
-  if (itemState.stream) {
-    itemState.stream.getTracks().forEach((track) => track.stop());
+async function saveCameraSource(cameraId, sourceUrl, label) {
+  try {
+    const response = await fetch(`/api/cameras/${cameraId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_url: sourceUrl, label }),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || "Failed to save camera source");
+    }
+
+    const itemState = state.items.get(cameraId);
+    if (itemState) {
+      itemState.sourceDraft = sourceUrl;
+    }
+
+    await loadCameraConfigs();
+    renderIntersectionCards();
+    if (state.focusedId === cameraId) {
+      setFocusedIntersection(cameraId);
+    }
+    setStatus(`${label} saved`, "ok");
+    closeCameraDialog();
+  } catch (error) {
+    setStatus(`Save failed for ${label}: ${error.message}`, "alert");
   }
-
-  itemState.stream = null;
-
-  if (state.focusedId === intersectionId) {
-    state.lastPredictions = [];
-    clearOverlay();
-    focusVideo.srcObject = null;
-    currentDetectionsEl.textContent = "0";
-    setStatus("Focused feed is offline", "alert");
-  }
-
-  updateConnectedCount();
-  renderAuthorityChecklist();
 }
 
 function setFocusedIntersection(intersectionId) {
@@ -279,15 +346,33 @@ function setFocusedIntersection(intersectionId) {
   state.focusedId = intersectionId;
   focusNameEl.textContent = intersection.name;
 
-  const itemState = state.items.get(intersectionId);
-  if (itemState?.stream) {
-    focusVideo.srcObject = itemState.stream;
+  const camera = getCameraConfig(intersectionId);
+  if (camera.source_url) {
+    // Clear any previous focus refresh timer
+    if (state.focusRefreshTimer) {
+      clearInterval(state.focusRefreshTimer);
+      state.focusRefreshTimer = null;
+    }
+
+    // Use snapshot endpoint for focus view (single-image) and refresh periodically.
+    const setSnapshot = () => {
+      focusFeed.src = `/api/cameras/${intersectionId}/snapshot?ts=${Date.now()}`;
+    };
+
+    setSnapshot();
+    state.focusRefreshTimer = setInterval(setSnapshot, 800);
     setStatus(`Focused on ${intersection.name}`, "ok");
   } else {
-    focusVideo.srcObject = null;
+    // Clear any previous focus refresh timer
+    if (state.focusRefreshTimer) {
+      clearInterval(state.focusRefreshTimer);
+      state.focusRefreshTimer = null;
+    }
+
+    focusFeed.src = placeholderFeed(intersection.name, "No source configured for this tile");
     clearOverlay();
     currentDetectionsEl.textContent = "0";
-    setStatus(`${intersection.name} selected but currently offline`, "alert");
+    setStatus(`${intersection.name} selected but no source is configured`, "alert");
   }
 
   updateFocusedCardStyles();
@@ -300,13 +385,13 @@ function clearOverlay() {
 }
 
 function drawPredictions(predictions) {
-  if (!focusVideo.videoWidth || !focusVideo.videoHeight) return;
+  const frameWidth = focusFeed.naturalWidth || 0;
+  const frameHeight = focusFeed.naturalHeight || 0;
+  if (!frameWidth || !frameHeight) return;
 
-  focusOverlay.width = focusVideo.clientWidth;
-  focusOverlay.height = focusVideo.clientHeight;
+  focusOverlay.width = focusFeed.clientWidth;
+  focusOverlay.height = focusFeed.clientHeight;
 
-  const frameWidth = state.lastCaptureWidth || focusVideo.videoWidth;
-  const frameHeight = state.lastCaptureHeight || focusVideo.videoHeight;
   const scaleX = focusOverlay.width / frameWidth;
   const scaleY = focusOverlay.height / frameHeight;
   const context = focusOverlay.getContext("2d");
@@ -335,30 +420,15 @@ function drawPredictions(predictions) {
 }
 
 async function detectFocusFrame() {
-  const focused = state.items.get(state.focusedId);
-  if (!focused?.stream || state.detectionInFlight || focusVideo.readyState < 2) return;
+  const camera = getCameraConfig(state.focusedId);
+  if (!state.focusedId || !camera.source_url || state.detectionInFlight) return;
 
   state.detectionInFlight = true;
   try {
     const detectStartedAt = performance.now();
-    const canvas = document.createElement("canvas");
-    const sourceWidth = focusVideo.videoWidth;
-    const sourceHeight = focusVideo.videoHeight;
-    const scale = Math.min(1, DETECTION_MAX_DIM / Math.max(sourceWidth, sourceHeight));
-    canvas.width = Math.max(1, Math.round(sourceWidth * scale));
-    canvas.height = Math.max(1, Math.round(sourceHeight * scale));
-    const context = canvas.getContext("2d");
-    context.drawImage(focusVideo, 0, 0, canvas.width, canvas.height);
-
-    state.lastCaptureWidth = canvas.width;
-    state.lastCaptureHeight = canvas.height;
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", DETECTION_JPEG_QUALITY));
-    if (!blob) return;
-
-    const focusedIntersection = intersections.find((entry) => entry.id === state.focusedId);
     const formData = new FormData();
-    formData.append("frame", blob, "frame.jpg");
-    formData.append("source_name", focusedIntersection?.name || "unknown intersection");
+    formData.append("camera_id", state.focusedId);
+    formData.append("source_name", intersections.find((entry) => entry.id === state.focusedId)?.name || "unknown intersection");
 
     const response = await fetch("/api/detect", { method: "POST", body: formData });
     if (!response.ok) {
@@ -374,9 +444,9 @@ async function detectFocusFrame() {
     const accidents = data.accident_count || 0;
     currentDetectionsEl.textContent = String(accidents);
     if (data.accident_detected) {
-      setStatus(`ALERT on ${focusedIntersection?.name}: ${accidents} accident detection(s)`, "alert");
+      setStatus(`ALERT on ${camera.label || state.focusedId}: ${accidents} accident detection(s)`, "alert");
     } else {
-      setStatus(`Monitoring ${focusedIntersection?.name || "focus feed"}`, "ok");
+      setStatus(`Monitoring ${camera.label || "focus feed"}`, "ok");
     }
     renderAuthorityChecklist();
   } finally {
@@ -385,10 +455,7 @@ async function detectFocusFrame() {
 }
 
 async function refreshEvents() {
-  const [eventsResp, statsResp] = await Promise.all([
-    fetch("/api/events?limit=20"),
-    fetch("/api/stats"),
-  ]);
+  const [eventsResp, statsResp] = await Promise.all([fetch("/api/events?limit=20"), fetch("/api/stats")]);
 
   const eventsData = await eventsResp.json();
   const statsData = await statsResp.json();
@@ -430,9 +497,9 @@ function startDetection() {
     return;
   }
 
-  const focused = state.items.get(state.focusedId);
-  if (!focused?.stream) {
-    setStatus("Focused intersection is offline. Connect camera first", "alert");
+  const camera = getCameraConfig(state.focusedId);
+  if (!camera.source_url) {
+    setStatus("Focused intersection has no RTSP/IP source configured", "alert");
     return;
   }
 
@@ -474,43 +541,43 @@ function stopDetection() {
   if (state.eventsTimer) clearInterval(state.eventsTimer);
   state.eventsTimer = null;
   state.lastPredictions = [];
-  state.lastCaptureWidth = 0;
-  state.lastCaptureHeight = 0;
   clearOverlay();
   currentDetectionsEl.textContent = "0";
   setStatus("Detection stopped");
   renderAuthorityChecklist();
 }
 
-function cleanupAllStreams() {
-  state.items.forEach((itemState) => {
-    if (itemState.stream) {
-      itemState.stream.getTracks().forEach((track) => track.stop());
-    }
-  });
-}
-
 startBtn.addEventListener("click", startDetection);
 stopBtn.addEventListener("click", stopDetection);
 wallModeBtn.addEventListener("click", () => setViewMode("wall"));
 focusModeBtn.addEventListener("click", () => setViewMode("focus"));
-window.addEventListener("beforeunload", cleanupAllStreams);
 window.addEventListener("resize", () => drawPredictions(state.lastPredictions));
+focusFeed.addEventListener("load", () => drawPredictions(state.lastPredictions));
+cameraDialogInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    cameraDialogSaveBtn.click();
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeCameraDialog();
+  }
+});
+cameraDialogSaveBtn.addEventListener("click", () => {
+  if (!state.dialogCameraId) return;
+  const intersection = intersections.find((item) => item.id === state.dialogCameraId);
+  if (!intersection) return;
+  saveCameraSource(state.dialogCameraId, cameraDialogInput.value.trim(), intersection.name);
+});
+cameraDialogCancelBtn.addEventListener("click", closeCameraDialog);
+cameraDialog.addEventListener("click", (event) => {
+  if (event.target?.dataset?.action === "close") {
+    closeCameraDialog();
+  }
+});
 
 (async function init() {
-  try {
-    const permissionStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-    permissionStream.getTracks().forEach((track) => track.stop());
-  } catch (_error) {
-    setStatus("Camera permission is required to load and switch CCTV feeds", "alert");
-  }
-
-  try {
-    await loadDevices();
-  } catch (_error) {
-    setStatus("Could not enumerate camera devices", "alert");
-  }
-
+  await loadCameraConfigs();
   renderIntersectionCards();
   setFocusedIntersection(intersections[0].id);
   setViewMode("wall");

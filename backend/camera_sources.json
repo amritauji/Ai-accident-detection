@@ -1,0 +1,38 @@
+{
+  "int-1": {
+    "source_url": "",
+    "label": "Main St & 1st Ave"
+  },
+  "int-2": {
+    "source_url": "",
+    "label": "Central Blvd & Lake Rd"
+  },
+  "int-3": {
+    "source_url": "",
+    "label": "Airport Road Junction"
+  },
+  "int-4": {
+    "source_url": "",
+    "label": "Market Square Cross"
+  },
+  "int-5": {
+    "source_url": "",
+    "label": "River Bridge Exit"
+  },
+  "int-6": {
+    "source_url": "",
+    "label": "Highway 4 Flyover"
+  },
+  "int-7": {
+    "source_url": "",
+    "label": "Industrial Gate Loop"
+  },
+  "int-8": {
+    "source_url": "",
+    "label": "University Circle"
+  },
+  "int-9": {
+    "source_url": "",
+    "label": "Bus Terminal North"
+  }
+}

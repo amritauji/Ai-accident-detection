@@ -1,16 +1,22 @@
 ﻿# AI Car Accident Detection Dashboard
 
-Live UI + backend service for camera-based accident detection using Roboflow cloud or local ONNX offline inference.
+Live dashboard for IP camera and RTSP accident detection using Roboflow cloud or local ONNX offline inference.
 
 ## Features
-- Live webcam or USB camera feed in browser
-- Real-time frame inference
+- Live IP camera or RTSP feed in browser
+- Real-time inference from the focused camera stream
 - Two inference modes:
   - `roboflow_cloud` (online)
   - `onnx_offline` (no internet required at runtime)
 - Bounding-box overlay with class and confidence
 - Accident event logging into SQLite
 - Snapshot storage for detected incidents
+
+## How It Works
+1. Add an IP camera or RTSP URL to a tile in the camera matrix.
+2. Click `Focus` to open the live preview for that camera.
+3. Click `Start Detection` to send the focused camera frames to Roboflow for live inferencing.
+4. Accident detections are drawn on the focus view and saved to SQLite with snapshots.
 
 ## Project Structure
 - `backend/app.py`: FastAPI API + inference pipeline + SQLite event store
@@ -34,9 +40,14 @@ Live UI + backend service for camera-based accident detection using Roboflow clo
    ```
 3. Start server:
    ```powershell
-   uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
+   python -m uvicorn backend.app:app --reload --host 127.0.0.1 --port 8000
    ```
 4. Open `http://localhost:8000`
+
+## Live Camera Flow
+- Enter the IP camera URL in the tile or camera dialog.
+- The focus view uses the selected camera snapshot feed.
+- Detection runs on the selected `camera_id`, so the frames going to Roboflow are the IP camera frames, not the laptop webcam.
 
 ## Offline Inference Setup
 1. Export your Roboflow model as `YOLOv8 ONNX`.
@@ -53,7 +64,8 @@ Live UI + backend service for camera-based accident detection using Roboflow clo
 
 ## API Endpoints
 - `GET /api/health` (returns current `mode`)
-- `POST /api/detect` (multipart: `frame`, `source_name`)
+- `POST /api/detect` (multipart: `frame` or `camera_id`, `source_name`)
+- `GET /api/cameras/{camera_id}/snapshot`
 - `GET /api/events?limit=20`
 - `GET /api/stats`
 

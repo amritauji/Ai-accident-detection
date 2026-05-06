@@ -1,8 +1,11 @@
 import base64
 import io
 import json
+import logging
 import os
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,13 +14,15 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_DIR = ROOT / "backend" / "snapshots"
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = ROOT / "backend" / "accidents.db"
+CAMERA_CONFIG_PATH = ROOT / "backend" / "camera_sources.json"
 load_dotenv(ROOT / ".env")
 
 DETECTION_MODE = os.getenv("DETECTION_MODE", "roboflow_cloud").strip().lower()
@@ -51,6 +56,250 @@ app.add_middleware(
 _ONNX_SESSION = None
 _ROBOFLOW_SESSION = requests.Session()
 _ROBOFLOW_SESSION.headers.update({"Connection": "keep-alive"})
+LOGGER = logging.getLogger(__name__)
+
+
+class CameraConfigUpdate(BaseModel):
+    source_url: str = Field(default="", description="RTSP, HTTP, or other OpenCV-compatible source URL")
+    label: str | None = Field(default=None, description="Optional display label")
+
+
+class CameraStream:
+    def __init__(self, camera_id: str, source_url: str = "", label: str = "") -> None:
+        self.camera_id = camera_id
+        self.source_url = source_url.strip()
+        self.label = label.strip()
+        self.last_error = ""
+        self.last_frame_jpeg: bytes | None = None
+        self.last_frame_at: float | None = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def update(self, source_url: str, label: str | None = None) -> None:
+        with self._lock:
+            self.source_url = source_url.strip()
+            if label is not None:
+                self.label = label.strip()
+
+    def snapshot(self) -> bytes | None:
+        with self._lock:
+            return self.last_frame_jpeg
+
+    def _open_capture(self, source_url: str):
+        import cv2
+
+        if not hasattr(cv2, "VideoCapture"):
+            raise RuntimeError(
+                "OpenCV is installed, but this Python environment does not expose cv2.VideoCapture. "
+                "Reinstall opencv-python-headless inside the active venv."
+            )
+
+        if source_url.lower().startswith(("rtsp://", "rtsps://")):
+            capture = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+        else:
+            capture = cv2.VideoCapture(source_url)
+        try:
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        return capture
+
+    def _run(self) -> None:
+        backoff_seconds = 1.0
+        while not self._stop_event.is_set():
+            with self._lock:
+                source_url = self.source_url
+
+            if not source_url:
+                with self._lock:
+                    self.last_error = "No source configured"
+                time.sleep(0.5)
+                continue
+
+            try:
+                capture = self._open_capture(source_url)
+            except Exception as exc:  # pragma: no cover - hardware/backend dependent
+                with self._lock:
+                    self.last_error = f"Open error: {exc}"
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 1.5, 5.0)
+                continue
+
+            if not capture or not capture.isOpened():
+                with self._lock:
+                    self.last_error = f"Could not open source: {source_url}"
+                try:
+                    capture.release()
+                except Exception:
+                    pass
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 1.5, 5.0)
+                continue
+
+            backoff_seconds = 1.0
+            with self._lock:
+                self.last_error = ""
+
+            try:
+                import cv2
+
+                while not self._stop_event.is_set():
+                    with self._lock:
+                        current_source = self.source_url
+
+                    if current_source != source_url:
+                        break
+
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        with self._lock:
+                            self.last_error = f"Failed to read frame from {source_url}"
+                        break
+
+                    success, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if success:
+                        jpeg_bytes = buffer.tobytes()
+                        with self._lock:
+                            self.last_frame_jpeg = jpeg_bytes
+                            self.last_frame_at = time.time()
+                            self.last_error = ""
+                    else:
+                        with self._lock:
+                            self.last_error = f"Failed to encode frame from {source_url}"
+
+                    time.sleep(0.02)
+            finally:
+                try:
+                    capture.release()
+                except Exception:
+                    pass
+
+            time.sleep(0.25)
+
+
+class CameraManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._configs = self._load_configs()
+        self._streams: dict[str, CameraStream] = {}
+
+    def _default_configs(self) -> dict[str, dict[str, str]]:
+        return {
+            "int-1": {"source_url": "", "label": "Main St & 1st Ave"},
+            "int-2": {"source_url": "", "label": "Central Blvd & Lake Rd"},
+            "int-3": {"source_url": "", "label": "Airport Road Junction"},
+            "int-4": {"source_url": "", "label": "Market Square Cross"},
+            "int-5": {"source_url": "", "label": "River Bridge Exit"},
+            "int-6": {"source_url": "", "label": "Highway 4 Flyover"},
+            "int-7": {"source_url": "", "label": "Industrial Gate Loop"},
+            "int-8": {"source_url": "", "label": "University Circle"},
+            "int-9": {"source_url": "", "label": "Bus Terminal North"},
+        }
+
+    def _load_configs(self) -> dict[str, dict[str, str]]:
+        if not CAMERA_CONFIG_PATH.exists():
+            return self._default_configs()
+
+        try:
+            payload = json.loads(CAMERA_CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return self._default_configs()
+        except Exception:
+            return self._default_configs()
+
+        defaults = self._default_configs()
+        for camera_id, config in payload.items():
+            if camera_id not in defaults or not isinstance(config, dict):
+                continue
+            defaults[camera_id]["source_url"] = str(config.get("source_url", "")).strip()
+            defaults[camera_id]["label"] = str(config.get("label", defaults[camera_id]["label"])).strip() or defaults[camera_id]["label"]
+        return defaults
+
+    def _save_configs(self) -> None:
+        CAMERA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CAMERA_CONFIG_PATH.write_text(json.dumps(self._configs, indent=2), encoding="utf-8")
+
+    def list_cameras(self) -> list[dict[str, Any]]:
+        with self._lock:
+            items = []
+            for camera_id, config in self._configs.items():
+                stream = self._streams.get(camera_id)
+                items.append(
+                    {
+                        "id": camera_id,
+                        "label": config.get("label", camera_id),
+                        "source_url": config.get("source_url", ""),
+                        "active": bool(config.get("source_url")),
+                        "has_frame": bool(stream and stream.snapshot()),
+                        "last_error": stream.last_error if stream else "",
+                    }
+                )
+            return items
+
+    def get_camera(self, camera_id: str) -> dict[str, str]:
+        with self._lock:
+            if camera_id not in self._configs:
+                raise HTTPException(status_code=404, detail=f"Unknown camera id: {camera_id}")
+            return dict(self._configs[camera_id])
+
+    def set_camera(self, camera_id: str, source_url: str, label: str | None = None) -> dict[str, str]:
+        with self._lock:
+            if camera_id not in self._configs:
+                raise HTTPException(status_code=404, detail=f"Unknown camera id: {camera_id}")
+
+            current = self._configs[camera_id]
+            current["source_url"] = source_url.strip()
+            if label is not None and label.strip():
+                current["label"] = label.strip()
+
+            stream = self._streams.get(camera_id)
+            if stream is None:
+                stream = CameraStream(camera_id, current["source_url"], current["label"])
+                self._streams[camera_id] = stream
+            else:
+                stream.update(current["source_url"], current["label"])
+
+            self._save_configs()
+            return dict(current)
+
+    def clear_camera(self, camera_id: str) -> None:
+        self.set_camera(camera_id, "")
+
+    def ensure_stream(self, camera_id: str) -> CameraStream:
+        with self._lock:
+            config = self._configs.get(camera_id)
+            if config is None:
+                raise HTTPException(status_code=404, detail=f"Unknown camera id: {camera_id}")
+
+            stream = self._streams.get(camera_id)
+            if stream is None:
+                stream = CameraStream(camera_id, config.get("source_url", ""), config.get("label", camera_id))
+                self._streams[camera_id] = stream
+            return stream
+
+    def latest_frame(self, camera_id: str) -> bytes | None:
+        stream = self.ensure_stream(camera_id)
+        return stream.snapshot()
+
+    def stream_response(self, camera_id: str) -> StreamingResponse:
+        stream = self.ensure_stream(camera_id)
+
+        def frame_iterator():
+            boundary = b"--frame\r\n"
+            while True:
+                frame = stream.snapshot()
+                if frame is None:
+                    time.sleep(0.25)
+                    continue
+                yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                time.sleep(0.08)
+
+        return StreamingResponse(frame_iterator(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+CAMERA_MANAGER = CameraManager()
 
 
 def init_db() -> None:
@@ -312,6 +561,46 @@ def startup_event() -> None:
     init_db()
 
 
+@app.get("/api/cameras")
+def list_cameras() -> dict[str, Any]:
+    return {"cameras": CAMERA_MANAGER.list_cameras()}
+
+
+@app.get("/api/cameras/{camera_id}")
+def get_camera(camera_id: str) -> dict[str, Any]:
+    return {"camera": CAMERA_MANAGER.get_camera(camera_id)}
+
+
+@app.post("/api/cameras/{camera_id}")
+def update_camera(camera_id: str, payload: CameraConfigUpdate) -> dict[str, Any]:
+    camera = CAMERA_MANAGER.set_camera(camera_id, payload.source_url, payload.label)
+    return {"camera": camera}
+
+
+@app.delete("/api/cameras/{camera_id}")
+def clear_camera(camera_id: str) -> dict[str, str]:
+    CAMERA_MANAGER.clear_camera(camera_id)
+    return {"status": "cleared"}
+
+
+@app.get("/api/cameras/{camera_id}/stream")
+def camera_stream(camera_id: str) -> StreamingResponse:
+    return CAMERA_MANAGER.stream_response(camera_id)
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id: str):
+    """Return the latest JPEG frame for a camera as a single image response.
+
+    This is useful for focus previews where a single image (with proper
+    content-length and natural dimensions) is preferred over an MJPEG stream.
+    """
+    image_bytes = CAMERA_MANAGER.latest_frame(camera_id)
+    if image_bytes is None:
+        raise HTTPException(status_code=503, detail=f"Camera {camera_id} has no available frame yet")
+    return StreamingResponse(io.BytesIO(image_bytes), media_type="image/jpeg", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "mode": DETECTION_MODE}
@@ -319,10 +608,27 @@ def health() -> dict[str, str]:
 
 @app.post("/api/detect")
 def detect(
-    frame: UploadFile = File(...),
-    source_name: str = Form("webcam"),
+    frame: UploadFile | None = File(default=None),
+    source_name: str = Form("ipcam"),
+    camera_id: str | None = Form(default=None),
 ) -> dict[str, Any]:
-    image_bytes = frame.file.read()
+    image_bytes: bytes | None = None
+    input_source = "upload"
+
+    if camera_id:
+        image_bytes = CAMERA_MANAGER.latest_frame(camera_id)
+        if image_bytes is None:
+            raise HTTPException(status_code=503, detail=f"Camera {camera_id} has no available frame yet")
+        camera = CAMERA_MANAGER.get_camera(camera_id)
+        source_name = camera.get("label") or source_name
+        input_source = "camera_id"
+        LOGGER.info("Running live inference on camera %s (%s)", camera_id, source_name)
+    elif frame is not None:
+        image_bytes = frame.file.read()
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Provide either a frame upload or a camera_id")
+
     prediction = predict(image_bytes)
     predictions = prediction.get("predictions", [])
 
@@ -333,6 +639,7 @@ def detect(
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "source_name": source_name,
+        "input_source": input_source,
         "mode": DETECTION_MODE,
         "accident_detected": len(accidents) > 0,
         "accident_count": len(accidents),
