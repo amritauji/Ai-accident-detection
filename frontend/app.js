@@ -473,7 +473,6 @@ async function refreshEvents() {
       <p><strong>Time:</strong> ${new Date(event.created_at).toLocaleString()}</p>
       <p><strong>Source:</strong> ${event.source_name || "unknown"}</p>
       <p><strong>BBox:</strong> x=${Math.round(event.bbox.x || 0)}, y=${Math.round(event.bbox.y || 0)}, w=${Math.round(event.bbox.width || 0)}, h=${Math.round(event.bbox.height || 0)}</p>
-      ${event.image_url ? `<img class="thumb" src="${event.image_url}" alt="Accident snapshot ${event.id}"/>` : ""}
     `;
     eventsList.appendChild(item);
   });

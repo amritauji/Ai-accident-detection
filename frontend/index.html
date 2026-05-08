@@ -11,6 +11,33 @@
         background: radial-gradient(circle at 12% 0%, #172633 0%, #0d141b 45%, #090d11 100%);
         color: #e8f0f8;
       }
+
+      .site-nav {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin: 18px 0 0;
+        flex-wrap: wrap;
+      }
+
+      .nav-link {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 10px 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: #e8f0f8;
+        text-decoration: none;
+        font-weight: 700;
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .nav-link.active {
+        background: rgba(255, 179, 71, 0.16);
+        border-color: rgba(255, 179, 71, 0.38);
+        color: #ffd8a3;
+      }
     </style>
   </head>
   <body class="wall-mode">
@@ -22,6 +49,10 @@
               <p class="eyebrow">City Traffic Authority</p>
               <h1 class="heading">CCTV Accident Monitoring Command Center</h1>
               <p class="subtle">Add an RTSP or IP camera URL for each intersection, monitor all feeds, and run detection on the selected focus feed.</p>
+              <nav class="site-nav" aria-label="Primary">
+                <a href="/" class="nav-link active">Dashboard</a>
+                <a href="/accidents" class="nav-link">Accident Events</a>
+              </nav>
             </div>
             <div class="mode-switch" role="group" aria-label="Display mode">
               <button id="wallModeBtn" class="mode-btn active">Wall View</button>

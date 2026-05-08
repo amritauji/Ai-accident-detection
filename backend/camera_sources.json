@@ -1,6 +1,6 @@
 {
   "int-1": {
-    "source_url": "",
+    "source_url": "http://10.157.42.85:8080/video",
     "label": "Main St & 1st Ave"
   },
   "int-2": {

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Accident Gallery</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Rajdhani:wght@600;700&display=swap" />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #071018;
+        --panel: rgba(11, 19, 28, 0.86);
+        --panel-strong: rgba(15, 25, 36, 0.96);
+        --line: rgba(142, 164, 188, 0.18);
+        --text: #edf4fb;
+        --muted: #9fb2c5;
+        --accent: #ffb347;
+        --accent-2: #61d8b8;
+        --warn: #ff6b6b;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: Manrope, Segoe UI, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 15% 20%, rgba(255, 179, 71, 0.12), transparent 22%),
+          radial-gradient(circle at 85% 0%, rgba(97, 216, 184, 0.11), transparent 24%),
+          linear-gradient(180deg, #08111a 0%, #050b11 100%);
+      }
+
+      .shell {
+        max-width: 1360px;
+        margin: 0 auto;
+        padding: 28px 20px 40px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.4fr 0.9fr;
+        gap: 18px;
+        align-items: stretch;
+        margin-bottom: 20px;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, var(--panel), rgba(10, 17, 24, 0.78));
+        border-radius: 24px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(18px);
+      }
+
+      .hero-main {
+        padding: 28px;
+      }
+
+      .eyebrow {
+        margin: 0 0 12px;
+        color: var(--accent);
+        text-transform: uppercase;
+        letter-spacing: 0.22em;
+        font-size: 0.78rem;
+        font-weight: 800;
+      }
+
+      h1, h2, h3 {
+        margin: 0;
+        font-family: Rajdhani, Manrope, sans-serif;
+      }
+
+      h1 {
+        font-size: clamp(2.2rem, 5vw, 4.7rem);
+        line-height: 0.95;
+      }
+
+      .subtle {
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .hero-copy {
+        margin-top: 18px;
+        max-width: 72ch;
+        font-size: 1rem;
+      }
+
+      .hero-meta {
+        display: grid;
+        gap: 14px;
+        padding: 20px;
+      }
+
+      .meta-card {
+        padding: 16px 18px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .meta-label {
+        font-size: 0.82rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+      }
+
+      .meta-value {
+        margin-top: 6px;
+        font-size: 1.25rem;
+        font-weight: 800;
+      }
+
+      .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin: 18px 0 18px;
+      }
+
+      .site-nav {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 18px;
+      }
+
+      .button, .backlink {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+        padding: 12px 16px;
+        border-radius: 999px;
+        text-decoration: none;
+        font-weight: 700;
+      }
+
+      .button:hover, .backlink:hover {
+        border-color: rgba(255, 179, 71, 0.45);
+      }
+
+      .nav-link {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+        padding: 10px 14px;
+        border-radius: 999px;
+        text-decoration: none;
+        font-weight: 700;
+      }
+
+      .nav-link.active {
+        background: rgba(255, 179, 71, 0.16);
+        border-color: rgba(255, 179, 71, 0.38);
+        color: #ffd8a3;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .card {
+        overflow: hidden;
+        border-radius: 22px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, var(--panel-strong), rgba(9, 16, 23, 0.94));
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.24);
+        position: relative;
+      }
+
+      .card-image-wrap {
+        position: relative;
+      }
+
+      .card img {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 10;
+        object-fit: cover;
+        background: #091018;
+      }
+
+      .card-body {
+        padding: 16px;
+      }
+
+      .card-title {
+        font-size: 1.22rem;
+        font-weight: 800;
+        margin-bottom: 10px;
+      }
+
+      .card-status {
+        margin-top: 12px;
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+
+      .processing-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        padding: 18px;
+        background: linear-gradient(180deg, rgba(6, 11, 16, 0.18), rgba(6, 11, 16, 0.72));
+        backdrop-filter: blur(6px);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 180ms ease;
+      }
+
+      .card.is-loading .processing-overlay {
+        opacity: 1;
+      }
+
+      .processing-spinner {
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        border: 2px solid rgba(255, 255, 255, 0.25);
+        border-top-color: #ffd7a0;
+        animation: spin 0.8s linear infinite;
+        flex: 0 0 auto;
+      }
+
+      .processing-title {
+        font-size: 0.92rem;
+        font-weight: 800;
+      }
+
+      .processing-subtitle {
+        color: var(--muted);
+        font-size: 0.82rem;
+        margin-top: 2px;
+      }
+
+      .card.is-loading img {
+        filter: saturate(0.85) brightness(0.78);
+      }
+
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+
+      .description {
+        display: grid;
+        gap: 6px;
+        margin: 0 0 14px;
+      }
+
+      .description p {
+        margin: 0;
+        color: #d9e6f2;
+        line-height: 1.5;
+      }
+
+      .tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border-radius: 999px;
+        padding: 7px 10px;
+        background: rgba(255, 255, 255, 0.06);
+        color: #eaf2f9;
+        font-size: 0.84rem;
+        font-weight: 700;
+      }
+
+      .tag.accent {
+        background: rgba(255, 179, 71, 0.14);
+        color: #ffd7a0;
+      }
+
+      .tag.alert {
+        background: rgba(255, 107, 107, 0.12);
+        color: #ffb9b9;
+      }
+
+      .tag.severity.high {
+        background: rgba(255, 76, 76, 0.16);
+        color: #ff9d9d;
+      }
+
+      .tag.severity.medium {
+        background: rgba(255, 163, 61, 0.16);
+        color: #ffd0a0;
+      }
+
+      .tag.severity.low {
+        background: rgba(255, 214, 82, 0.16);
+        color: #ffe89f;
+      }
+
+      .tag.severity.unknown {
+        background: rgba(159, 178, 197, 0.12);
+        color: #d9e6f2;
+      }
+
+      .empty {
+        padding: 40px;
+        text-align: center;
+        color: var(--muted);
+        border: 1px dashed rgba(255, 255, 255, 0.12);
+        border-radius: 24px;
+      }
+
+      @media (max-width: 1100px) {
+        .hero,
+        .grid {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .hero,
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        .shell {
+          padding: 18px 14px 28px;
+        }
+
+        .hero-main,
+        .hero-meta {
+          padding: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="panel hero-main">
+          <p class="eyebrow">Accident Gallery</p>
+          <h1>Incident snapshots with instant context</h1>
+          <p class="hero-copy subtle">
+            A separate gallery page for reviewing detected accident images in a clean grid layout.
+            Each card shows the Cloudinary image, a short incident description, and the key metadata.
+          </p>
+          <nav class="site-nav" aria-label="Primary">
+            <a class="nav-link" href="/">Dashboard</a>
+            <a class="nav-link active" href="/accidents">Accident Events</a>
+          </nav>
+          <div class="toolbar">
+            <a class="backlink" href="/">Back to command center</a>
+            <button id="refreshBtn" class="button" type="button">Refresh gallery</button>
+          </div>
+        </div>
+
+        <aside class="panel hero-meta">
+          <div class="meta-card">
+            <div class="meta-label">Latest incident</div>
+            <div id="latestIncident" class="meta-value">Loading...</div>
+          </div>
+          <div class="meta-card">
+            <div class="meta-label">Confidence</div>
+            <div id="latestConfidence" class="meta-value">--</div>
+          </div>
+          <div class="meta-card">
+            <div class="meta-label">Gallery status</div>
+            <div id="galleryStatus" class="meta-value">Fetching events</div>
+          </div>
+        </aside>
+      </section>
+
+      <section id="galleryGrid" class="grid"></section>
+      <div id="emptyState" class="empty" hidden>No accident images available yet.</div>
+    </main>
+
+    <script src="/static/accidents.js"></script>
+  </body>
+</html>

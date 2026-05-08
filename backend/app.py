@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sqlite3
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -11,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import numpy as np
+import cv2
+import cloudinary
+import cloudinary.uploader
+from inference_sdk import InferenceHTTPClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +37,16 @@ ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "")
 ROBOFLOW_MODEL_ID = os.getenv("ROBOFLOW_MODEL_ID", "road-accident-2vton/4")
 ROBOFLOW_CONFIDENCE = os.getenv("ROBOFLOW_CONFIDENCE", "40")
 
+LOCAL_INFERENCE_URL = os.getenv(
+    "LOCAL_INFERENCE_URL",
+    "http://localhost:9001"
+)
+
+LOCAL_CLIENT = InferenceHTTPClient(
+    api_url="http://localhost:9001",
+    api_key=ROBOFLOW_API_KEY,
+)
+
 OFFLINE_MODEL_PATH = os.getenv("OFFLINE_MODEL_PATH", "models/road-accident.onnx")
 OFFLINE_INPUT_SIZE = int(os.getenv("OFFLINE_INPUT_SIZE", "640"))
 OFFLINE_CONFIDENCE = float(os.getenv("OFFLINE_CONFIDENCE", "0.35"))
@@ -42,6 +58,12 @@ MODEL_CLASS_NAMES = [
 ACCIDENT_CLASSES = {
     c.strip().lower() for c in os.getenv("ACCIDENT_CLASSES", "accident,crash,collision").split(",") if c.strip()
 }
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+)
 
 app = FastAPI(title="AI Accident Detection Dashboard API", version="1.1.0")
 
@@ -57,11 +79,24 @@ _ONNX_SESSION = None
 _ROBOFLOW_SESSION = requests.Session()
 _ROBOFLOW_SESSION.headers.update({"Connection": "keep-alive"})
 LOGGER = logging.getLogger(__name__)
+ANALYSIS_SERIAL_LOCK = threading.Lock()
 
 
 class CameraConfigUpdate(BaseModel):
     source_url: str = Field(default="", description="RTSP, HTTP, or other OpenCV-compatible source URL")
     label: str | None = Field(default=None, description="Optional display label")
+
+
+def normalize_source_url(source_url: str) -> str:
+    cleaned = source_url.strip()
+    if not cleaned:
+        return ""
+
+    if re.match(r"^(https?|rtsp|rtsps):[^/]", cleaned):
+        scheme, remainder = cleaned.split(":", 1)
+        return f"{scheme}://{remainder.lstrip('/')}"
+
+    return cleaned
 
 
 class CameraStream:
@@ -79,7 +114,7 @@ class CameraStream:
 
     def update(self, source_url: str, label: str | None = None) -> None:
         with self._lock:
-            self.source_url = source_url.strip()
+            self.source_url = normalize_source_url(source_url)
             if label is not None:
                 self.label = label.strip()
 
@@ -96,15 +131,36 @@ class CameraStream:
                 "Reinstall opencv-python-headless inside the active venv."
             )
 
-        if source_url.lower().startswith(("rtsp://", "rtsps://")):
-            capture = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+        normalized_source = normalize_source_url(source_url)
+        backend_candidates: list[tuple[Any, Any | None]] = []
+
+        if normalized_source.isdigit():
+            backend_candidates.append((int(normalized_source), None))
+            if hasattr(cv2, "CAP_V4L2"):
+                backend_candidates.append((int(normalized_source), cv2.CAP_V4L2))
         else:
-            capture = cv2.VideoCapture(source_url)
-        try:
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        return capture
+            backend_candidates.append((normalized_source, cv2.CAP_FFMPEG))
+            if hasattr(cv2, "CAP_GSTREAMER"):
+                backend_candidates.append((normalized_source, cv2.CAP_GSTREAMER))
+            backend_candidates.append((normalized_source, None))
+
+        last_capture = None
+        for candidate_source, backend in backend_candidates:
+            capture = cv2.VideoCapture(candidate_source) if backend is None else cv2.VideoCapture(candidate_source, backend)
+            last_capture = capture
+            if capture and capture.isOpened():
+                try:
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+                return capture
+
+            try:
+                capture.release()
+            except Exception:
+                pass
+
+        return last_capture
 
     def _run(self) -> None:
         backoff_seconds = 1.0
@@ -250,7 +306,7 @@ class CameraManager:
                 raise HTTPException(status_code=404, detail=f"Unknown camera id: {camera_id}")
 
             current = self._configs[camera_id]
-            current["source_url"] = source_url.strip()
+            current["source_url"] = normalize_source_url(source_url)
             if label is not None and label.strip():
                 current["label"] = label.strip()
 
@@ -313,42 +369,67 @@ def init_db() -> None:
                 confidence REAL,
                 class_name TEXT,
                 bbox_json TEXT,
+                camera_id TEXT,
                 image_path TEXT,
+                image_url TEXT,
+                ai_summary TEXT,
+                severity TEXT,
+                camera_location TEXT,
+                emergency_status TEXT,
                 raw_prediction_json TEXT
             )
             """
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(accident_events)").fetchall()}
+        for column_sql, column_name in [
+            ("ALTER TABLE accident_events ADD COLUMN image_url TEXT", "image_url"),
+            ("ALTER TABLE accident_events ADD COLUMN camera_id TEXT", "camera_id"),
+            ("ALTER TABLE accident_events ADD COLUMN ai_summary TEXT", "ai_summary"),
+            ("ALTER TABLE accident_events ADD COLUMN severity TEXT", "severity"),
+            ("ALTER TABLE accident_events ADD COLUMN camera_location TEXT", "camera_location"),
+            ("ALTER TABLE accident_events ADD COLUMN emergency_status TEXT", "emergency_status"),
+        ]:
+            if column_name not in columns:
+                conn.execute(column_sql)
         conn.commit()
 
 
 def roboflow_cloud_predict(image_bytes: bytes) -> dict[str, Any]:
-    if not ROBOFLOW_API_KEY:
-        raise HTTPException(status_code=500, detail="Set ROBOFLOW_API_KEY in .env")
-    if not ROBOFLOW_MODEL_ID:
-        raise HTTPException(status_code=500, detail="Set ROBOFLOW_MODEL_ID in .env")
-
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
-    url = (
-        f"https://detect.roboflow.com/{ROBOFLOW_MODEL_ID}"
-        f"?api_key={ROBOFLOW_API_KEY}&confidence={ROBOFLOW_CONFIDENCE}"
-    )
-
     try:
-        response = _ROBOFLOW_SESSION.post(
-            url,
-            data=encoded,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=20,
+
+        # Convert bytes -> numpy array
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+
+        # Decode image
+        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if image is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to decode image"
+            )
+
+        # Run local Jetson inference
+        result = LOCAL_CLIENT.infer(
+            image,
+            model_id=ROBOFLOW_MODEL_ID
         )
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
+
+        print("LOCAL INFERENCE RESULT:", result)
+
+        if not isinstance(result, dict):
             return {"predictions": []}
-        if not isinstance(payload.get("predictions"), list):
-            payload["predictions"] = []
-        return payload
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Roboflow cloud inference failed: {exc}") from exc
+
+        if "predictions" not in result:
+            result["predictions"] = []
+
+        return result
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Local Jetson inference failed: {exc}"
+        ) from exc
 
 
 def get_onnx_session() -> Any:
@@ -518,8 +599,294 @@ def is_accident_prediction(pred: dict[str, Any]) -> bool:
     return class_name in ACCIDENT_CLASSES
 
 
+def normalize_image_url(image_url: str | None) -> str | None:
+    if not image_url:
+        return None
+
+    cleaned = str(image_url).strip()
+    if cleaned.startswith("http://") or cleaned.startswith("https://"):
+        return cleaned
+
+    return None
+
+
+def normalize_ai_severity(severity: str | None) -> str:
+    normalized = str(severity or "").strip().upper()
+    if normalized in {"HIGH", "FATAL", "SEVERE", "CRITICAL"}:
+        return "HIGH"
+    if normalized in {"MEDIUM", "MAJOR"}:
+        return "MEDIUM"
+    if normalized in {"LOW", "MINOR"}:
+        return "LOW"
+    return "UNKNOWN"
+
+
+def fetch_image_bytes(image_url: str) -> bytes:
+    response = requests.get(image_url, timeout=30)
+    response.raise_for_status()
+    return response.content
+
+
+def parse_ai_report_payload(raw_response: str) -> dict[str, str]:
+    parsed = parse_ollama_json_report(raw_response)
+    if parsed:
+        return parsed
+
+    return {
+        "severity": infer_severity_from_text(raw_response),
+        "accident_type": "Unknown accident type",
+        "emergency": "Emergency response recommended.",
+        "summary": raw_response.strip() or "AI analysis unavailable.",
+    }
+
+
+def generate_accident_report_from_bytes(
+    image_bytes: bytes,
+    camera_id: str,
+    location: str,
+) -> dict[str, str]:
+    start_time = time.perf_counter()
+    try:
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        prompt = f"""
+You are an AI traffic accident analysis system.
+
+Analyze this accident image carefully.
+
+Determine:
+
+1. Severity Level (LOW, MEDIUM, HIGH)
+2. Accident Type
+3. Visible hazards
+4. Emergency urgency
+5. Short professional incident summary
+
+Rules:
+
+* Fire or explosion = HIGH
+* Vehicle rollover = MEDIUM/HIGH
+* Heavy frontal collision = HIGH
+* Minor impact with pole/wall = LOW
+
+Return ONLY valid JSON:
+
+{{
+  "severity": "HIGH",
+  "accident_type": "Vehicle rollover collision",
+  "emergency": "Immediate ambulance dispatch recommended",
+  "summary": "Major rollover accident detected with severe roadway obstruction."
+}}
+        """
+
+        LOGGER.info("Starting Ollama accident analysis for camera_id=%s location=%s", camera_id, location)
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "moondream:latest",
+                "prompt": prompt,
+                "images": [image_b64],
+                "stream": False,
+                "format": "json",
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        raw_response = str(data.get("response", "")).strip()
+        LOGGER.info("Ollama raw response: %s", raw_response)
+        print("OLLAMA RAW RESPONSE:", raw_response)
+
+        parsed = parse_ai_report_payload(raw_response)
+        summary_text = parsed.get("summary") or raw_response or "AI analysis unavailable."
+        severity = normalize_ai_severity(parsed.get("severity"))
+        if severity == "UNKNOWN":
+            severity = infer_severity_from_text(summary_text)
+
+        emergency = parsed.get("emergency") or "Emergency response recommended."
+        accident_type = parsed.get("accident_type") or "Unknown accident type"
+
+        return {
+            "summary": summary_text,
+            "severity": severity,
+            "emergency": emergency,
+            "accident_type": accident_type,
+            "raw_response": raw_response,
+        }
+    except Exception:
+        LOGGER.exception("Failed to generate AI report")
+        return {
+            "summary": "AI analysis unavailable.",
+            "severity": "UNKNOWN",
+            "emergency": "Emergency response recommended.",
+            "accident_type": "Unknown accident type",
+            "raw_response": "",
+        }
+    finally:
+        duration_seconds = time.perf_counter() - start_time
+        LOGGER.info("Ollama inference duration: %.3fs", duration_seconds)
+
+
+def generate_accident_report(
+    image_path: Path,
+    confidence: float,
+    camera_id: str,
+    location: str,
+) -> dict[str, str]:
+    return generate_accident_report_from_bytes(image_path.read_bytes(), camera_id, location)
+
+
+def classify_severity(confidence: float) -> str:
+    if confidence >= 0.85:
+        return "FATAL"
+
+    if confidence >= 0.65:
+        return "MAJOR"
+
+    return "MINOR"
+
+
+def infer_severity_from_text(text: str) -> str:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in ["fire", "explosion", "smoke", "pile-up", "destroyed", "major roadway obstruction", "severe"]):
+        return "HIGH"
+    if any(keyword in lowered for keyword in ["rollover", "overturned", "multi-vehicle", "collision", "impact", "obstruction", "blocked"]):
+        return "MEDIUM"
+    if any(keyword in lowered for keyword in ["minor", "bumped", "fender", "light", "small"]):
+        return "LOW"
+    return "UNKNOWN"
+
+
+def parse_ollama_json_report(raw_response: str) -> dict[str, str]:
+    cleaned = raw_response.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    candidates = [cleaned]
+    if not cleaned.startswith("{") or not cleaned.endswith("}"):
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            candidates.insert(0, match.group(0))
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+
+        if isinstance(parsed, dict):
+            return {
+                "severity": str(parsed.get("severity", "")).strip(),
+                "accident_type": str(parsed.get("accident_type", "")).strip(),
+                "emergency": str(parsed.get("emergency", "")).strip(),
+                "summary": str(parsed.get("summary", "")).strip(),
+            }
+
+    return {}
+
+
+def upload_accident_image(image_path: Path) -> str:
+    result = cloudinary.uploader.upload(
+        str(image_path),
+        folder="accidents",
+    )
+    return result["secure_url"]
+
+
+def generate_accident_report(
+    image_path: Path,
+    confidence: float,
+    camera_id: str,
+    location: str,
+) -> dict[str, str]:
+    start_time = time.perf_counter()
+    try:
+        image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+
+        prompt = f"""
+You are an AI traffic accident analysis system.
+
+Analyze this accident image carefully.
+
+Determine:
+
+1. Severity Level (LOW, MEDIUM, HIGH)
+2. Accident Type
+3. Visible hazards
+4. Emergency urgency
+5. Short professional incident summary
+
+Rules:
+
+* Fire or explosion = HIGH
+* Vehicle rollover = MEDIUM/HIGH
+* Heavy frontal collision = HIGH
+* Minor impact with pole/wall = LOW
+
+Return ONLY valid JSON:
+
+{{
+    "severity": "HIGH",
+    "accident_type": "Vehicle rollover collision",
+    "emergency": "Immediate ambulance dispatch recommended",
+    "summary": "Major rollover accident detected with severe roadway obstruction."
+}}
+        """
+
+        LOGGER.info("Starting Ollama accident analysis for camera_id=%s location=%s", camera_id, location)
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "moondream:latest",
+                "prompt": prompt,
+                "images": [image_b64],
+                "stream": False,
+                "format": "json",
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        raw_response = str(data.get("response", "")).strip()
+        LOGGER.info("Ollama raw response: %s", raw_response)
+        print("OLLAMA RAW RESPONSE:", raw_response)
+
+        parsed = parse_ollama_json_report(raw_response)
+        summary_text = parsed.get("summary") or raw_response or "AI analysis unavailable."
+        severity = normalize_ai_severity(parsed.get("severity"))
+        if severity == "UNKNOWN":
+            severity = infer_severity_from_text(summary_text)
+
+        emergency = parsed.get("emergency") or "Emergency response recommended."
+        accident_type = parsed.get("accident_type") or "Unknown accident type"
+
+        return {
+            "summary": summary_text,
+            "severity": severity,
+            "emergency": emergency,
+            "accident_type": accident_type,
+            "raw_response": raw_response,
+        }
+    except Exception:
+        LOGGER.exception("Failed to generate AI report")
+        return {
+            "summary": "AI analysis unavailable.",
+            "severity": "UNKNOWN",
+            "emergency": "Emergency response recommended.",
+            "accident_type": "Unknown accident type",
+            "raw_response": "",
+        }
+    finally:
+        duration_seconds = time.perf_counter() - start_time
+        LOGGER.info("Ollama inference duration: %.3fs", duration_seconds)
+
+
 def save_accident_event(
-    source_name: str,
+    camera_id: str,
+    location: str,
     pred: dict[str, Any],
     raw_prediction: dict[str, Any],
     image_bytes: bytes,
@@ -529,17 +896,36 @@ def save_accident_event(
     file_path = SNAPSHOT_DIR / file_name
     file_path.write_bytes(image_bytes)
 
+    confidence = float(pred.get("confidence", 0.0))
+    report = generate_accident_report(file_path, confidence, camera_id, location)
+    ai_summary = report.get("summary", "AI analysis unavailable.")
+    severity = normalize_ai_severity(report.get("severity"))
+    if severity == "UNKNOWN":
+        severity = infer_severity_from_text(ai_summary)
+    emergency_status = report.get("emergency", "Emergency response recommended.")
+
+    image_url: str | None = None
+    try:
+        image_url = upload_accident_image(file_path)
+    except Exception:
+        LOGGER.exception("Failed to upload accident image to Cloudinary")
+    finally:
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             INSERT INTO accident_events (
-                created_at, source_name, confidence, class_name, bbox_json, image_path, raw_prediction_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                created_at, source_name, confidence, class_name, bbox_json, camera_id, image_path, image_url, ai_summary, severity, camera_location, emergency_status, raw_prediction_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ts.isoformat(),
-                source_name,
-                float(pred.get("confidence", 0.0)),
+                location,
+                confidence,
                 str(pred.get("class", "unknown")),
                 json.dumps(
                     {
@@ -549,7 +935,13 @@ def save_accident_event(
                         "height": pred.get("height"),
                     }
                 ),
-                str(file_path.relative_to(ROOT)).replace("\\", "/"),
+                camera_id,
+                image_url,
+                image_url,
+                ai_summary,
+                severity,
+                location,
+                emergency_status,
                 json.dumps(raw_prediction),
             ),
         )
@@ -630,11 +1022,13 @@ def detect(
         raise HTTPException(status_code=400, detail="Provide either a frame upload or a camera_id")
 
     prediction = predict(image_bytes)
+    print(prediction)
     predictions = prediction.get("predictions", [])
 
     accidents = [p for p in predictions if is_accident_prediction(p)]
     for accident in accidents:
-        save_accident_event(source_name, accident, prediction, image_bytes)
+        resolved_camera_id = camera_id or source_name
+        save_accident_event(resolved_camera_id, source_name, accident, prediction, image_bytes)
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -654,7 +1048,7 @@ def events(limit: int = 25) -> dict[str, Any]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT id, created_at, source_name, confidence, class_name, bbox_json, image_path
+            SELECT id, created_at, source_name, confidence, class_name, bbox_json, camera_id, image_path, image_url, ai_summary, severity, camera_location, emergency_status
             FROM accident_events
             ORDER BY id DESC
             LIMIT ?
@@ -672,11 +1066,150 @@ def events(limit: int = 25) -> dict[str, Any]:
                 "confidence": row["confidence"],
                 "class_name": row["class_name"],
                 "bbox": json.loads(row["bbox_json"]),
+                "camera_id": row["camera_id"],
                 "image_path": row["image_path"],
-                "image_url": f"/{row['image_path']}" if row["image_path"] else None,
+                "image_url": normalize_image_url(row["image_url"]),
+                "ai_summary": row["ai_summary"],
+                "severity": row["severity"],
+                "camera_location": row["camera_location"],
+                "emergency_status": row["emergency_status"],
             }
         )
     return {"events": items}
+
+
+@app.post("/api/events/{event_id}/analyze")
+def analyze_event(event_id: int) -> dict[str, Any]:
+    print(f"\n{'='*80}")
+    print(f"[BACKEND] POST /api/events/{event_id}/analyze - ENDPOINT CALLED")
+    print(f"{'='*80}")
+    LOGGER.info(f"[ANALYZE {event_id}] Endpoint called")
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, created_at, source_name, confidence, class_name, bbox_json, camera_id, image_path, image_url, ai_summary, severity, camera_location, emergency_status
+            FROM accident_events
+            WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+
+        if row is None:
+            print(f"[BACKEND] Event {event_id} NOT FOUND in database")
+            LOGGER.error(f"[ANALYZE {event_id}] Event not found")
+            raise HTTPException(status_code=404, detail=f"Unknown accident event id: {event_id}")
+
+        existing_summary = str(row["ai_summary"] or "").strip()
+        existing_severity = normalize_ai_severity(row["severity"])
+        existing_emergency = str(row["emergency_status"] or "").strip()
+        
+        print(f"[BACKEND] Event {event_id} - has_summary: {bool(existing_summary)}, severity: {existing_severity}, emergency: {bool(existing_emergency)}")
+        
+        if existing_summary and existing_severity != "UNKNOWN" and existing_emergency:
+            print(f"[BACKEND] Event {event_id} - Already fully analyzed, returning cached result")
+            LOGGER.info(f"[ANALYZE {event_id}] Returning cached analysis")
+            return {
+                "id": row["id"],
+                "ai_summary": existing_summary,
+                "severity": existing_severity,
+                "emergency_status": existing_emergency,
+                "accident_type": "",
+            }
+
+        image_url = normalize_image_url(row["image_url"])
+        if not image_url:
+            print(f"[BACKEND] Event {event_id} - NO VALID IMAGE URL")
+            LOGGER.error(f"[ANALYZE {event_id}] No valid Cloudinary image URL")
+            raise HTTPException(status_code=400, detail=f"Event {event_id} does not have a downloadable Cloudinary image URL")
+
+        print(f"[BACKEND] Event {event_id} - Queued for serial analysis")
+        LOGGER.info(f"[ANALYZE {event_id}] Waiting for serial analysis lock")
+
+        with ANALYSIS_SERIAL_LOCK:
+            print(f"[BACKEND] Event {event_id} - Acquired analysis lock")
+            LOGGER.info(f"[ANALYZE {event_id}] Analysis lock acquired")
+
+            conn.row_factory = sqlite3.Row
+            latest_row = conn.execute(
+                """
+                SELECT ai_summary, severity, emergency_status, camera_id, source_name, camera_location, confidence, image_url
+                FROM accident_events
+                WHERE id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if latest_row is None:
+                raise HTTPException(status_code=404, detail=f"Unknown accident event id: {event_id}")
+
+            latest_summary = str(latest_row["ai_summary"] or "").strip()
+            latest_severity = normalize_ai_severity(latest_row["severity"])
+            latest_emergency = str(latest_row["emergency_status"] or "").strip()
+            if latest_summary and latest_severity != "UNKNOWN" and latest_emergency:
+                print(f"[BACKEND] Event {event_id} - Analysis completed by another request, returning cached result")
+                LOGGER.info(f"[ANALYZE {event_id}] Returning cached analysis after lock")
+                return {
+                    "id": event_id,
+                    "camera_id": str(latest_row["camera_id"] or latest_row["source_name"] or f"event-{event_id}"),
+                    "camera_location": str(latest_row["camera_location"] or latest_row["source_name"] or "unknown location"),
+                    "confidence": float(latest_row["confidence"] or 0.0),
+                    "image_url": normalize_image_url(str(latest_row["image_url"] or "")),
+                    "ai_summary": latest_summary,
+                    "severity": latest_severity,
+                    "emergency_status": latest_emergency,
+                }
+
+            image_url = normalize_image_url(str(latest_row["image_url"] or ""))
+            if not image_url:
+                print(f"[BACKEND] Event {event_id} - NO VALID IMAGE URL after lock")
+                LOGGER.error(f"[ANALYZE {event_id}] No valid Cloudinary image URL after lock")
+                raise HTTPException(status_code=400, detail=f"Event {event_id} does not have a downloadable Cloudinary image URL")
+
+            print(f"[BACKEND] Event {event_id} - Fetching image from: {image_url[:80]}...")
+            camera_id = str(latest_row["camera_id"] or latest_row["source_name"] or f"event-{event_id}")
+            location = str(latest_row["camera_location"] or latest_row["source_name"] or "unknown location")
+            confidence = float(latest_row["confidence"] or 0.0)
+            LOGGER.info(f"[ANALYZE {event_id}] Starting Moondream LLM analysis with image_url")
+            print(f"[BACKEND] Event {event_id} - Downloading image bytes...")
+            image_bytes = fetch_image_bytes(image_url)
+            print(f"[BACKEND] Event {event_id} - Downloaded {len(image_bytes)} bytes, calling Moondream LLM...")
+            report = generate_accident_report_from_bytes(image_bytes, camera_id, location)
+            print(f"[BACKEND] Event {event_id} - Moondream LLM response: {report}")
+
+            ai_summary = report.get("summary", "AI analysis unavailable.")
+            severity = normalize_ai_severity(report.get("severity"))
+            if severity == "UNKNOWN":
+                severity = infer_severity_from_text(ai_summary)
+            emergency_status = report.get("emergency", "Emergency response recommended.")
+            
+            print(f"[BACKEND] Event {event_id} - Parsed report: severity={severity}, emergency={emergency_status}, summary_len={len(ai_summary)}")
+            print(f"[BACKEND] Event {event_id} - Updating SQLite database...")
+
+            conn.execute(
+                """
+                UPDATE accident_events
+                SET ai_summary = ?, severity = ?, emergency_status = ?
+                WHERE id = ?
+                """,
+                (ai_summary, severity, emergency_status, event_id),
+            )
+            conn.commit()
+            print(f"[BACKEND] Event {event_id} - Database updated successfully!")
+            LOGGER.info(f"[ANALYZE {event_id}] Analysis complete, database updated")
+
+    print(f"[BACKEND] Event {event_id} - Returning result to client")
+    return {
+        "id": event_id,
+        "camera_id": camera_id,
+        "camera_location": location,
+        "confidence": confidence,
+        "image_url": image_url,
+        "ai_summary": ai_summary,
+        "severity": severity,
+        "emergency_status": emergency_status,
+        "accident_type": report.get("accident_type", "Unknown accident type"),
+    }
 
 
 @app.get("/api/stats")
@@ -699,5 +1232,10 @@ app.mount("/static", StaticFiles(directory=ROOT / "frontend"), name="static")
 @app.get("/")
 def root() -> FileResponse:
     return FileResponse(ROOT / "frontend" / "index.html")
+
+
+@app.get("/accidents")
+def accident_gallery() -> FileResponse:
+    return FileResponse(ROOT / "frontend" / "accidents.html")
 
 
